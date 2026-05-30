@@ -285,7 +285,9 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
             // Pull it out via the authState StateFlow snapshot — if we're not
             // paired yet, return null and the fetch fails with a clean error.
             (authManager.authState.value as? AuthState.Paired)?.token
-        }
+        },
+        certPinStore = authManager.certPinStore,
+        appContext = application,
     )
 
     // --- Relay connection state ---

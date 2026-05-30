@@ -1,21 +1,30 @@
 package com.hermesandroid.relay.network
 
+import android.content.Context
 import android.util.Log
+import androidx.core.app.NotificationCompat
+import com.hermesandroid.relay.BuildConfig
+import com.hermesandroid.relay.accessibility.HermesAccessibilityService
+import com.hermesandroid.relay.auth.CertPinStore
 import com.hermesandroid.relay.auth.PairedDeviceInfo
 import com.hermesandroid.relay.diagnostics.DiagnosticCategory
 import com.hermesandroid.relay.diagnostics.DiagnosticSeverity
 import com.hermesandroid.relay.diagnostics.DiagnosticsLog
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
+import okhttp3.CertificatePinner
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import javax.net.ssl.SSLPeerUnverifiedException
 
 /**
  * HTTP client for the Hermes relay media endpoint.
@@ -40,7 +49,22 @@ import java.io.IOException
 class RelayHttpClient(
     private val okHttpClient: OkHttpClient,
     private val relayUrlProvider: () -> String?,
-    private val sessionTokenProvider: suspend () -> String?
+    private val sessionTokenProvider: suspend () -> String?,
+    /**
+     * Optional certificate pin store for the relay HTTP client.
+     *
+     * When provided, the client wraps the base [okHttpClient] with:
+     *  1. A [CertificatePinner] built from the store's TOFU pins, so
+     *     connections to relays whose cert doesn't match are refused.
+     *  2. An interceptor that catches [SSLPeerUnverifiedException] pin
+     *     failures and fires a high-priority security notification +
+     *     auto-disables the bridge via [HermesAccessibilityService.setMasterEnabled].
+     *
+     * Nullable for backwards-compat with tests.
+     */
+    private val certPinStore: CertPinStore? = null,
+    /** Application context — required when [certPinStore] is non-null. */
+    private val appContext: Context? = null,
 ) {
 
     companion object {
@@ -51,6 +75,142 @@ class RelayHttpClient(
             coerceInputValues = true
             explicitNulls = false
         }
+
+        /** Notification channel ID for security alerts (certificate pinning failures). */
+        private const val CHANNEL_SECURITY = "bridge_security"
+
+        /** Notification ID for the MITM / cert-pin-failure alert. */
+        private const val NOTIFICATION_ID_SECURITY = 0x5EC1 // 24257
+
+        /**
+         * Ensure the security notification channel exists.
+         * Call once from app.onCreate() or before the first security notification.
+         */
+        fun ensureSecurityChannel(context: Context) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                    as? android.app.NotificationManager ?: return
+            if (nm.getNotificationChannel(CHANNEL_SECURITY) != null) return
+            val channel = android.app.NotificationChannel(
+                CHANNEL_SECURITY,
+                "Relay Security Alerts",
+                android.app.NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Critical security warnings — certificate pinning failures and potential MITM attacks."
+                enableVibration(true)
+                setShowBadge(true)
+            }
+            nm.createNotificationChannel(channel)
+        }
+
+        /**
+         * Build a [CertificatePinner] from the current TOFU pin store snapshot.
+         * Returns [CertificatePinner.DEFAULT] (allows all) when pins are empty
+         * so first-time TOFU still works.
+         *
+         * Mirrors the same pattern used in [ConnectionManager.buildClient].
+         */
+        private fun buildPinnerFromStore(certPinStore: CertPinStore): CertificatePinner {
+            return try {
+                val pins = runBlocking { certPinStore.buildPinnerSnapshot() }
+                pins
+            } catch (e: Exception) {
+                Log.w(TAG, "Failed to build CertificatePinner from store: ${e.message}")
+                CertificatePinner.DEFAULT
+            }
+        }
+
+        /**
+         * Create an OkHttp [Interceptor] that catches pin failures and fires
+         * a security notification + auto-disables the bridge.
+         */
+        private fun createPinFailureInterceptor(
+            context: Context,
+        ): Interceptor = Interceptor { chain ->
+            try {
+                chain.proceed(chain.request())
+            } catch (e: SSLPeerUnverifiedException) {
+                if (e.message?.contains("Certificate pinning failure") == true) {
+                    Log.e(TAG, "Certificate pinning failure — potential MITM: ${e.message}")
+                    DiagnosticsLog.record(
+                        category = DiagnosticCategory.Relay,
+                        severity = DiagnosticSeverity.Error,
+                        title = "Certificate pinning failure",
+                        detail = e.message,
+                    )
+                    // Fire security notification
+                    notifyPotentialMitM(context, e)
+                    // Auto-disable the bridge
+                    runBlocking {
+                        try {
+                            HermesAccessibilityService.setMasterEnabled(
+                                context = context.applicationContext,
+                                enabled = false,
+                            )
+                            Log.i(TAG, "Bridge auto-disabled due to certificate pinning failure")
+                        } catch (ex: Exception) {
+                            Log.e(TAG, "Failed to auto-disable bridge: ${ex.message}")
+                        }
+                    }
+                }
+                throw e
+            }
+        }
+
+        /**
+         * Show a high-priority security alert notification for potential MITM.
+         */
+        private fun notifyPotentialMitM(context: Context, e: SSLPeerUnverifiedException) {
+            ensureSecurityChannel(context)
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE)
+                    as? android.app.NotificationManager ?: return
+
+            val notification = NotificationCompat.Builder(context, CHANNEL_SECURITY)
+                .setSmallIcon(R.mipmap.ic_launcher)
+                .setContentTitle("Relay server identity changed!")
+                .setContentText("The relay server certificate does not match the paired fingerprint. Bridge has been disabled.")
+                .setStyle(NotificationCompat.BigTextStyle().bigText(
+                    "The relay server's security certificate has changed since pairing. " +
+                        "This could indicate a network attack. The bridge has been " +
+                        "automatically disabled for your protection. " +
+                        "Re-pair in the app to re-enable.\n\n" +
+                        "Error: ${e.message ?: "unknown"}"
+                ))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_ALARM)
+                .setAutoCancel(true)
+                .build()
+
+            try {
+                nm.notify(NOTIFICATION_ID_SECURITY, notification)
+            } catch (ex: Exception) {
+                Log.e(TAG, "Failed to post security notification: ${ex.message}")
+            }
+        }
+    }
+
+    /**
+     * The effective OkHttp client used by this RelayHttpClient.
+     *
+     * When [certPinStore] is non-null, this is a derived client that adds:
+     *  1. A [CertificatePinner] built from the store's TOFU pins.
+     *  2. A [Interceptor] that catches pin failures → notification + auto-disable.
+     *
+     * When [certPinStore] is null this is the raw client passed to the constructor.
+     */
+    private val effectiveClient: OkHttpClient = buildEffectiveClient()
+
+    private fun buildEffectiveClient(): OkHttpClient {
+        if (certPinStore == null || appContext == null) return okHttpClient
+        val builder = okHttpClient.newBuilder()
+        try {
+            val pinner = buildPinnerFromStore(certPinStore)
+            builder.certificatePinner(pinner)
+        } catch (e: Exception) {
+            Log.w(TAG, "Failed to attach CertificatePinner: ${e.message}")
+        }
+        builder.addInterceptor(createPinFailureInterceptor(appContext))
+        return builder.build()
     }
 
     /**
@@ -119,7 +279,7 @@ class RelayHttpClient(
             .build()
 
         try {
-            okHttpClient.newCall(request).execute().use { response ->
+            effectiveClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val reason = when (response.code) {
                         401, 403 -> "Unauthorized — re-pair with the relay"
@@ -225,7 +385,7 @@ class RelayHttpClient(
             .build()
 
         try {
-            okHttpClient.newCall(request).execute().use { response ->
+            effectiveClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val reason = when (response.code) {
                         401 -> "Unauthorized — re-pair with the relay"
@@ -314,7 +474,7 @@ class RelayHttpClient(
             .build()
 
         try {
-            okHttpClient.newCall(request).execute().use { response ->
+            effectiveClient.newCall(request).execute().use { response ->
                 if (response.code == 404) {
                     // Server hasn't shipped the endpoint yet — degrade to
                     // empty list so the UI can render "No paired devices"
@@ -403,7 +563,7 @@ class RelayHttpClient(
             .build()
 
         try {
-            okHttpClient.newCall(request).execute().use { response ->
+            effectiveClient.newCall(request).execute().use { response ->
                 if (response.code == 404) {
                     // Already gone — treat as success so the UI can just
                     // drop the row on the next refresh.
@@ -522,7 +682,7 @@ class RelayHttpClient(
             .build()
 
         try {
-            okHttpClient.newCall(request).execute().use { response ->
+            effectiveClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     val reason = when (response.code) {
                         400 -> "Invalid extend request (check TTL/grants)"
@@ -616,7 +776,7 @@ class RelayHttpClient(
 
         // Fast-timeout client — we don't want Save & Test to hang the UI
         // for 10 seconds on a dead URL.
-        val fastClient = okHttpClient.newBuilder()
+        val fastClient = effectiveClient.newBuilder()
             .connectTimeout(3, java.util.concurrent.TimeUnit.SECONDS)
             .readTimeout(3, java.util.concurrent.TimeUnit.SECONDS)
             .writeTimeout(3, java.util.concurrent.TimeUnit.SECONDS)
