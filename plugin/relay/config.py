@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import socket
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,162 @@ from urllib.parse import urlparse
 import yaml
 
 logger = logging.getLogger(__name__)
+
+
+# ── Tailscale auto-detect ────────────────────────────────────────────────────
+
+_TAILSCALE_STATUS_TIMEOUT = 5
+
+
+@dataclass
+class TailscaleDetection:
+    """Result of probing for Tailscale at relay startup.
+
+    Stored on ``RelayConfig`` so the ``main()`` function and the
+    Tailscale watchdog share a single probe result without re-running
+    ``tailscale status --json`` on every tick.
+    """
+
+    #: True when the ``tailscale`` binary is present and the daemon is
+    #: connected to a tailnet (``BackendState == "Running"``).
+    active: bool = False
+    #: The MagicDNS hostname from ``Self.DNSName`` (e.g.
+    #: ``mybox.tail1234.ts.net``).  ``None`` when Tailscale is not active.
+    hostname: str | None = None
+    #: The tailnet's DNS suffix (e.g. ``tail1234.ts.net``).  Used to
+    #: distinguish official Tailscale (has ``.ts.net`` magic DNS) from
+    #: Headscale.  ``None`` when unavailable.
+    tailnet_dns: str | None = None
+    #: True when this is a Headscale network (no ``CertDomains`` in the
+    #: status JSON).  Headscale does not provide auto-TLS, so the relay
+    #: must fall back to manual cert provisioning.
+    is_headscale: bool = False
+    #: First IPv4 Tailscale address.  ``None`` when not available.
+    ipv4: str | None = None
+    #: Ports already published via ``tailscale serve`` at probe time.
+    serve_ports: list[int] = field(default_factory=list)
+    #: Human-readable diagnostic message when Tailscale could not be
+    #: detected (e.g. ``"binary absent"``, ``"daemon not running"``).
+    message: str = ""
+
+
+def detect_tailscale() -> TailscaleDetection:
+    """Probe for Tailscale and return a structured ``TailscaleDetection``.
+
+    Safe to call unconditionally — never raises.  Returns an inactive
+    ``TailscaleDetection`` with a diagnostic ``message`` when the binary
+    is absent, the daemon is stopped, or the JSON is unparseable.
+    """
+    ts = TailscaleDetection()
+
+    # 1. Is the binary on PATH?
+    if shutil.which("tailscale") is None:
+        ts.message = "binary absent"
+        return ts
+
+    # 2. Run ``tailscale status --json`` with a short timeout.
+    try:
+        result = subprocess.run(  # noqa: S603 — static argv
+            ["tailscale", "status", "--json"],
+            capture_output=True,
+            timeout=_TAILSCALE_STATUS_TIMEOUT,
+            text=True,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        ts.message = f"tailscale status timed out after {_TAILSCALE_STATUS_TIMEOUT}s"
+        return ts
+    except OSError as exc:
+        ts.message = f"os error: {exc}"
+        return ts
+    except Exception as exc:  # pragma: no cover — never-raises contract
+        ts.message = f"unexpected error: {exc}"
+        return ts
+
+    if result.returncode != 0:
+        ts.message = result.stderr.strip() or "tailscale status exited non-zero"
+        return ts
+
+    # 3. Parse JSON.
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        ts.message = "tailscale status returned invalid JSON"
+        return ts
+    if not isinstance(data, dict):
+        ts.message = "tailscale status JSON was not a dict"
+        return ts
+
+    # 4. Check backend state.
+    backend = data.get("BackendState")
+    if backend != "Running":
+        ts.message = f"backend state: {backend}"
+        return ts
+
+    # 5. Extract Self node identity.
+    self_node = data.get("Self") or {}
+    if not isinstance(self_node, dict):
+        ts.message = "missing 'Self' in tailscale status"
+        return ts
+    if not self_node.get("DNSName") and not self_node.get("HostName"):
+        ts.message = "'Self' node is empty in tailscale status"
+        return ts
+
+    dns_name = self_node.get("DNSName") or self_node.get("HostName")
+    if isinstance(dns_name, str):
+        ts.hostname = dns_name.strip().rstrip(".")
+
+    # Extract IPv4.
+    ips = self_node.get("TailscaleIPs") or []
+    for ip in ips:
+        if isinstance(ip, str) and ":" not in ip:
+            ts.ipv4 = ip.strip()
+            break
+
+    # 6. Detect Headscale (no CertDomains = no auto-TLS).
+    cert_domains = data.get("CertDomains")
+    ts.is_headscale = not bool(cert_domains)
+
+    # Derive tailnet DNS suffix from hostname.
+    if ts.hostname and ts.hostname.count(".") >= 2:
+        parts = ts.hostname.split(".", 1)
+        ts.tailnet_dns = parts[1] if len(parts) == 2 else None
+
+    # 7. Parse serve ports (best-effort).
+    try:
+        serve_result = subprocess.run(  # noqa: S603 — static argv
+            ["tailscale", "serve", "status", "--json"],
+            capture_output=True,
+            timeout=_TAILSCALE_STATUS_TIMEOUT,
+            text=True,
+            check=False,
+        )
+    except Exception:  # pragma: no cover — best-effort
+        serve_result = None
+    if serve_result is not None and serve_result.returncode == 0 and serve_result.stdout.strip():
+        try:
+            serve_data = json.loads(serve_result.stdout)
+        except json.JSONDecodeError:
+            serve_data = None
+        if isinstance(serve_data, dict):
+            ports: set[int] = set()
+            for section_key in ("TCP", "Web"):
+                section = serve_data.get(section_key)
+                if isinstance(section, dict):
+                    for key in section.keys():
+                        if isinstance(key, str):
+                            tail = key.rsplit(":", 1)[-1]
+                            try:
+                                ports.add(int(tail))
+                            except ValueError:
+                                continue
+            ts.serve_ports = sorted(ports)
+
+    ts.active = True
+    ts.message = "active"
+    if ts.is_headscale:
+        ts.message = "active (headscale — no auto-TLS)"
+    return ts
 
 # Characters used for pairing codes. Full A-Z + 0-9 alphabet (36 chars) so
 # codes the phone generates with AuthManager.PAIRING_CODE_CHARS always
@@ -80,6 +238,14 @@ class RelayConfig:
     # rejected unless explicitly opted into for local LAN testing.
     trust_proxy_headers: bool = False
     allow_insecure_api_bearer: bool = False
+
+    # Tailscale auto-detect at startup.
+    # ``RelayConfig.from_env`` calls :func:`detect_tailscale` and stores
+    # the result here.  The watchdog in ``server.py`` may update it at
+    # runtime.  When ``tailscale.active`` is False the relay behaves
+    # exactly as before (bind to the configured host, no serve, no WSS
+    # URL override).
+    tailscale: TailscaleDetection = field(default_factory=TailscaleDetection)
 
     # Provider-neutral voice output broker. This is the default assistant
     # speech renderer: final Hermes text goes in, streamed provider PCM comes
@@ -311,6 +477,9 @@ class RelayConfig:
             os.getenv("RELAY_REALTIME_VOICE_XAI_OAUTH_PATH")
             or config.realtime_voice_xai_oauth_path
         )
+
+        # ── Tailscale auto-detect ──────────────────────────────────────────
+        config.tailscale = detect_tailscale()
 
         config.profiles = _load_profiles(
             config.hermes_config_path,

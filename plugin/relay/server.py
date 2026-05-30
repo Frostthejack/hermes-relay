@@ -469,10 +469,23 @@ async def handle_pairing_mint(request: web.Request) -> web.Response:
     # ── Relay block (nested in the QR payload) ───────────────────────────
     # URL derives from the relay's own bind config — the relay knows where
     # the phone should connect. Matches pair.py:746 exactly.
-    relay_tls = bool(server.config.ssl_cert)
-    relay_url = _relay_lan_base_url(
-        server.config.host, server.config.port, tls=relay_tls
-    )
+    _ts = server.config.tailscale
+    if _ts.active and not _ts.is_headscale and _ts.hostname:
+        # Tailscale fronts the relay with TLS termination.
+        # Phone connects to https://<hostname>:<port>/ (tailscale serve).
+        relay_tls = True
+        relay_url = f"https://{_ts.hostname}:{server.config.port}/ws"
+    elif _ts.active and _ts.is_headscale and _ts.hostname:
+        # Headscale — no auto-TLS.  Fall back to wss:// if certs are
+        # configured, otherwise ws:// with the MagicDNS hostname.
+        relay_tls = bool(server.config.ssl_cert)
+        scheme = "wss" if relay_tls else "ws"
+        relay_url = f"{scheme}://{_ts.hostname}:{server.config.port}/ws"
+    else:
+        relay_tls = bool(server.config.ssl_cert)
+        relay_url = _relay_lan_base_url(
+            server.config.host, server.config.port, tls=relay_tls
+        )
     if endpoints_list is not None:
         normalized_endpoints = normalize_endpoint_candidates(
             endpoints_list,
@@ -3943,6 +3956,106 @@ def main() -> None:
     # Build the app
     app = create_app(config)
 
+    # ── Tailscale auto-TLS ──────────────────────────────────────────────────
+    _ts_cfg = config.tailscale
+    if _ts_cfg.active and not _ts_cfg.is_headscale:
+        # Bind relay to loopback — tailscale serve fronts it.
+        old_host = config.host
+        config.host = "127.0.0.1"
+        logger.info(
+            "Tailscale active — overriding bind %s → 127.0.0.1 "
+            "(hostname=%s tailnet=%s)",
+            old_host,
+            _ts_cfg.hostname,
+            _ts_cfg.tailnet_dns,
+        )
+
+        # Publish relay loopback port via tailscale serve.
+        from .tailscale import enable_stack
+        serve_result = enable_stack(
+            relay_port=config.port,
+            api_port=None,  # API is served by hermes-agent, not relay
+            https=True,
+        )
+        if serve_result.get("ok"):
+            logger.info(
+                "Tailscale serve enabled for relay port %d", config.port
+            )
+        else:
+            logger.warning(
+                "Tailscale serve enable failed: %s", serve_result.get("message")
+            )
+
+        # Start watchdog: poll tailscale status every 30 s.
+        _ts_serve_ports: list[int] = _ts_cfg.serve_ports[:]
+
+        async def _tailscale_watchdog(app: web.Application) -> None:
+            """Poll ``tailscale status --json`` every 30 s.
+
+            When Tailscale goes away (daemon stopped, network change) the
+            relay rebinds to the original host so LAN connections keep
+            working.  When Tailscale comes back the relay re-binds to
+            loopback and re-enables ``tailscale serve``.
+            """
+            nonlocal _ts_serve_ports
+            cfg: RelayConfig = app["server"].config
+            prev_active = True
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    from .config import detect_tailscale
+                    probe = detect_tailscale()
+                except Exception as exc:  # pragma: no cover — watchdog
+                    logger.debug("Tailscale watchdog probe failed: %s", exc)
+                    continue
+
+                if probe.active and not prev_active:
+                    # Tailscale came back.
+                    logger.info(
+                        "Tailscale watchdog — re-activating (hostname=%s)",
+                        probe.hostname,
+                    )
+                    cfg.host = "127.0.0.1"
+                    cfg.tailscale = probe
+                    enable_stack(relay_port=cfg.port, api_port=None, https=True)
+                    prev_active = True
+                elif not probe.active and prev_active:
+                    # Tailscale went away — fall back to LAN bind.
+                    fallback = (
+                        args.host
+                        if args.host is not None
+                        else os.getenv("RELAY_HOST", "0.0.0.0")
+                    )
+                    logger.warning(
+                        "Tailscale watchdog — Tailscale lost, "
+                        "re-binding to %s for LAN access",
+                        fallback,
+                    )
+                    cfg.host = fallback
+                    cfg.tailscale = probe
+                    disable_stack(relay_port=cfg.port, api_port=None)
+                    prev_active = False
+
+        async def _tailscale_cleanup(app: web.Application) -> None:
+            """Remove tailscale serve on shutdown."""
+            try:
+                from .tailscale import disable_stack
+                disable_stack(relay_port=config.port, api_port=None)
+                logger.info("Tailscale serve removed on shutdown")
+            except Exception as exc:  # pragma: no cover
+                logger.debug("Tailscale cleanup error: %s", exc)
+
+        app.on_startup.append(_tailscale_watchdog)
+        app.on_cleanup.append(_tailscale_cleanup)
+
+    elif _ts_cfg.active and _ts_cfg.is_headscale:
+        # Headscale: no auto-TLS, fall back to manual certs.
+        logger.info(
+            "Tailscale active (Headscale detected — no auto-TLS). "
+            "Set RELAY_SSL_CERT / RELAY_SSL_KEY for TLS, or use "
+            "manual cert provisioning."
+        )
+
     # Pre-register a pairing code from CLI/env so the relay will accept it
     # when the phone sends its locally-generated code during auth.
     import os as _os
@@ -3979,6 +4092,16 @@ def main() -> None:
         config.port,
     )
     logger.info("WebAPI target: %s", config.webapi_url)
+    if config.tailscale.active:
+        logger.info(
+            "Tailscale: %s (hostname=%s tailnet=%s headscale=%s)",
+            config.tailscale.message,
+            config.tailscale.hostname or "(unknown)",
+            config.tailscale.tailnet_dns or "(unknown)",
+            config.tailscale.is_headscale,
+        )
+    else:
+        logger.info("Tailscale: %s", config.tailscale.message)
     logger.info(
         "Profile discovery: %s",
         "enabled" if config.profile_discovery_enabled else "disabled",
