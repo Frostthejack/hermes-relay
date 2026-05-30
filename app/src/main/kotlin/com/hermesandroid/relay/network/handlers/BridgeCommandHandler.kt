@@ -10,6 +10,7 @@ import com.hermesandroid.relay.accessibility.HermesAccessibilityService
 import com.hermesandroid.relay.accessibility.ScreenCapture
 import com.hermesandroid.relay.accessibility.ScreenReader
 // === PHASE3-safety-rails: safety enforcement ===
+import com.hermesandroid.relay.bridge.ActionRateLimiter
 import com.hermesandroid.relay.bridge.BridgeSafetyManager
 // === END PHASE3-safety-rails ===
 // === v0.4.1 unattended-access wake/dismiss ===
@@ -149,6 +150,9 @@ class BridgeCommandHandler(
     // without the full DI graph still compile; in production ConnectionViewModel
     // always wires a BridgeSafetyManager instance and passes it in.
     private val safetyManager: BridgeSafetyManager? = null,
+    // Rate limiter for per-path throttling — guards against rapid command
+    // bursts from a looping LLM or compromised server. Optional for tests.
+    private val rateLimiter: ActionRateLimiter? = null,
     // === END PHASE3-safety-rails ===
     // === v0.4.1 polish: activity-log recording ===
     // Optional sink for BridgeActivityEntry records — fired at respond()
@@ -621,6 +625,32 @@ class BridgeCommandHandler(
                 }
             )
         }
+
+        // === PHASE3-rate-limit: per-path rate limiting ===
+        // Enforce sliding-window rate caps on action paths to prevent a
+        // looping LLM or compromised server from firing thousands of taps /
+        // swipes / SMS sends per minute. Also detects perfectly regular
+        // intervals (< 50ms variance) as automated bot patterns.
+        val rl = rateLimiter
+        if (rl != null && !rl.tryAcquire(path)) {
+            return respond(
+                requestId, 429,
+                buildJsonObject {
+                    put(
+                        "error",
+                        "Rate limit exceeded for '$path'. The command was " +
+                            "throttled to prevent rapid automated execution. " +
+                            "Wait before retrying.",
+                    )
+                    put("error_code", "rate_limited")
+                    put(
+                        "required_action",
+                        "Wait and retry the command after a brief pause",
+                    )
+                },
+            )
+        }
+        // === END PHASE3-rate-limit ===
 
         // Destructive-verb gate — /tap_text and /type carry text in their
         // body directly, /tap + /long_press carry a node_id we resolve via

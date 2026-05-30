@@ -132,6 +132,20 @@ jobs:
           sha256sum apk/*/release/*.apk bundle/*Release/*.aab > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.4.1'
+
+      - name: Sign SHA256SUMS with cosign keyless
+        run: |
+          cd app/build/outputs
+          cosign sign-blob \
+            --yes \
+            --output-signature SHA256SUMS.sig \
+            --output-certificate SHA256SUMS.cert \
+            SHA256SUMS.txt
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -150,6 +164,8 @@ jobs:
             app/build/outputs/apk/*/release/*.apk
             app/build/outputs/bundle/*Release/*.aab
             app/build/outputs/SHA256SUMS.txt
+            app/build/outputs/SHA256SUMS.sig
+            app/build/outputs/SHA256SUMS.cert
 
       - name: Release summary
         env:
