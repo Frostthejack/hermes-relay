@@ -12,6 +12,8 @@ import com.hermesandroid.relay.accessibility.ScreenReader
 // === PHASE3-safety-rails: safety enforcement ===
 import com.hermesandroid.relay.bridge.ActionRateLimiter
 import com.hermesandroid.relay.bridge.BridgeSafetyManager
+import com.hermesandroid.relay.bridge.BridgeStatusOverlay
+import com.hermesandroid.relay.util.SensitiveAppDetector // B3.6 + B3.7 sensitive app protection
 // === END PHASE3-safety-rails ===
 // === v0.4.1 unattended-access wake/dismiss ===
 import com.hermesandroid.relay.bridge.UnattendedAccessManager
@@ -651,6 +653,36 @@ class BridgeCommandHandler(
             )
         }
         // === END PHASE3-rate-limit ===
+
+        // === B3.7 sensitive app protection ===
+        // Auto-enable FLAG_SECURE on the bridge overlay and block clipboard
+        // reads when a sensitive app (banking, password manager, 2FA) is
+        // in the foreground. This prevents screenshots/screen-recording of
+        // credentials and blocks clipboard exfiltration (copied passwords).
+        val isSensitive = SensitiveAppDetector.isSensitiveApp(service, service.currentApp)
+        if (isSensitive) {
+            BridgeStatusOverlay.peek()?.setSecureFlag(true)
+            // Block GET /clipboard — could exfiltrate copied passwords
+            if (path == "/clipboard" && method.uppercase() == "GET") {
+                return respond(
+                    requestId, 403,
+                    buildJsonObject {
+                        put(
+                            "error",
+                            "Clipboard access blocked while a sensitive app is " +
+                                "in the foreground (${service.currentApp}). " +
+                                "This is a security protection for banking apps, " +
+                                "password managers, and authentication apps.",
+                        )
+                        put("error_code", "sensitive_app_protection")
+                    },
+                )
+            }
+        } else {
+            // Re-enable normal overlay when a non-sensitive app is foregrounded.
+            BridgeStatusOverlay.peek()?.setSecureFlag(false)
+        }
+        // === END B3.7 sensitive app protection ===
 
         // Destructive-verb gate — /tap_text and /type carry text in their
         // body directly, /tap + /long_press carry a node_id we resolve via

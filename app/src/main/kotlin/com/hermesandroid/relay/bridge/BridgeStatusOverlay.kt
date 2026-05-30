@@ -92,6 +92,19 @@ class BridgeStatusOverlay(context: Context) : ConfirmationOverlayHost {
     private var chipUnattended: Boolean = false
     private val activeConfirmations = ConcurrentHashMap<Long, View>()
 
+    /**
+     * When true, FLAG_SECURE is applied to all overlay WindowManager.LayoutParams
+     * (chip + confirmation modal). Prevents screenshots and screen-recording
+     * while a sensitive app is in the foreground.
+     *
+     * Auto-enabled by [com.hermesandroid.relay.network.handlers.BridgeCommandHandler]
+     * when [com.hermesandroid.relay.util.SensitiveAppDetector] reports the current
+     * foreground package matches a sensitive prefix. Auto-disabled when the
+     * foreground app changes to a non-sensitive package.
+     */
+    @Volatile
+    private var secureFlagEnabled: Boolean = false
+
     // ── Status chip ──────────────────────────────────────────────────────
 
     /**
@@ -138,20 +151,7 @@ class BridgeStatusOverlay(context: Context) : ConfirmationOverlayHost {
         }
         attachLifecycle(compose)
 
-        val params = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            WindowManager.LayoutParams.WRAP_CONTENT,
-            overlayType(),
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
-            PixelFormat.TRANSLUCENT,
-        ).apply {
-            gravity = Gravity.TOP or Gravity.END
-            x = 24
-            y = 96
-        }
+        val params = chipLayoutParams()
 
         runCatching { wm.addView(compose, params) }
             .onFailure {
@@ -161,6 +161,56 @@ class BridgeStatusOverlay(context: Context) : ConfirmationOverlayHost {
         compose.post { ComposeArrWorkaround.disableForViewTree(compose) }
         chipView = compose
         chipUnattended = unattended
+    }
+
+    // ── FLAG_SECURE (B3.6 sensitive app protection) ─────────────────────
+
+    /**
+     * Enable or disable FLAG_SECURE on all overlay windows.
+     *
+     * When [enabled] is true, the overlay's WindowManager.LayoutParams include
+     * [WindowManager.LayoutParams.FLAG_SECURE], preventing screenshots and
+     * screen-recording through the bridge overlay while a sensitive app is
+     * in the foreground.
+     *
+     * Takes effect on the NEXT overlay attach (chip or confirmation modal).
+     * If the chip is already showing, it is recreated to pick up the new flag.
+     */
+    fun setSecureFlag(enabled: Boolean) {
+        if (secureFlagEnabled == enabled) return
+        secureFlagEnabled = enabled
+        Log.d(TAG, "FLAG_SECURE ${if (enabled) "enabled" else "disabled"}")
+
+        // If the chip is currently showing, force a rebuild so the new
+        // flag is applied to its WindowManager.LayoutParams.
+        if (chipView != null) {
+            setChipVisible(true, chipUnattended)
+        }
+    }
+
+    /** Returns true when FLAG_SECURE is currently active on overlay params. */
+    fun isSecureFlagEnabled(): Boolean = secureFlagEnabled
+
+    /**
+     * Return base layout params for the status chip, with FLAG_SECURE
+     * conditionally applied based on [secureFlagEnabled].
+     */
+    private fun chipLayoutParams(): WindowManager.LayoutParams {
+        val flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        return WindowManager.LayoutParams(
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            overlayType(),
+            if (secureFlagEnabled) flags or WindowManager.LayoutParams.FLAG_SECURE else flags,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.END
+            x = 24
+            y = 96
+        }
     }
 
     // ── Confirmation modal ───────────────────────────────────────────────
@@ -214,7 +264,8 @@ class BridgeStatusOverlay(context: Context) : ConfirmationOverlayHost {
             WindowManager.LayoutParams.MATCH_PARENT,
             overlayType(),
             WindowManager.LayoutParams.FLAG_DIM_BEHIND or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                if (secureFlagEnabled) WindowManager.LayoutParams.FLAG_SECURE else 0,
             PixelFormat.TRANSLUCENT,
         ).apply {
             dimAmount = 0.6f
