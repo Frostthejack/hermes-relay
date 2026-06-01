@@ -540,7 +540,14 @@ fun RelayApp() {
             ),
             sessionId = lastSessionId,
         )
-        chatViewModel.refreshSessions()
+        // FIX: Skip refreshSessions if a stream is currently in flight.
+        // refreshSessions() replaces the session list wholesale, which races
+        // with the in-flight stream's onSessionId callback and can cause
+        // sessions to flash-disappear from the sidebar. The stream completion
+        // handler already triggers a sessions reload when needed.
+        if (!chatViewModel.isStreaming.value) {
+            chatViewModel.refreshSessions()
+        }
     }
 
     LaunchedEffect(selectedProfile?.name) {

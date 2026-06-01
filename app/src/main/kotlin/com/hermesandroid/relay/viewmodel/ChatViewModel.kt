@@ -1359,6 +1359,13 @@ class ChatViewModel : ViewModel() {
             // Sessions endpoint doesn't emit structured tool events during streaming —
             // tool calls are only available as JSON on the stored messages. Reload the
             // server-authoritative history to get proper message boundaries + tool_calls.
+            //
+            // FIX: Skip the reload for "runs" and "completions" endpoints.
+            // For "runs", the session is already tracked via the onSessionId
+            // callback mid-stream, and a wholesale reload here races with
+            // refreshSessions() triggered by the LaunchedEffect in RelayApp,
+            // causing messages to disappear. For "completions", the endpoint
+            // is stateless (no session), so there's nothing to reload.
             val sid = handler.currentSessionId.value
             if (sid != null && streamingEndpoint == "sessions") {
                 viewModelScope.launch {
@@ -1472,8 +1479,18 @@ class ChatViewModel : ViewModel() {
                     attachments = attachments,
                     voiceIntentMessages = voiceIntentMessages,
                     onSessionId = { sid ->
+                        // FIX: Only propagate session ID change if it's actually
+                        // different from the current one. When the server emits
+                        // 'response.created' mid-stream with the same session ID
+                        // that's already tracked, calling onSessionChanged triggers
+                        // switchProfileContext() → clearMessages() +
+                        // refreshSessions(), which races with the in-flight
+                        // stream and causes messages/sessions to disappear.
+                        val previousSid = handler.currentSessionId.value
                         handler.setSessionId(sid)
-                        onSessionChanged?.invoke(sid)
+                        if (previousSid != sid) {
+                            onSessionChanged?.invoke(sid)
+                        }
                     },
                     onMessageStarted = onMessageStartedCb,
                     onTextDelta = onTextDeltaCb,
