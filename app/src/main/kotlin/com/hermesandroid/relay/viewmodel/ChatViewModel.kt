@@ -430,7 +430,14 @@ class ChatViewModel : ViewModel() {
                 _pendingAttachments.value = emptyList()
                 chatHandler?.let { handler ->
                     handler.clearMessages()
-                    handler.clearSessions()
+                    // Only clear sessions when switching to a genuinely
+                    // different connection (non-empty id). An empty id
+                    // means "no successor" (teardownActive) — clearing
+                    // the list here races with the UI re-render and causes
+                    // sessions to flash-disappear from the sidebar.
+                    if (newConnectionId.isNotEmpty()) {
+                        handler.clearSessions()
+                    }
                     handler.setSessionId(null)
                 }
                 // Forward the null session id to the persisted
@@ -469,7 +476,10 @@ class ChatViewModel : ViewModel() {
         activeProfileContextKey = contextKey
         _queuedMessages.value = emptyList()
         _pendingAttachments.value = emptyList()
-        handler.clearSessions()
+        // Do NOT call clearSessions() here — it wipes the sidebar session
+        // list on every profile/context switch, causing sessions to
+        // flash-disappear. The merge logic in refreshSessions() (via
+        // updateSessions()) handles incremental updates correctly.
         handler.setSessionId(sessionId)
         handler.clearMessages()
         onSessionChanged?.invoke(sessionId)
