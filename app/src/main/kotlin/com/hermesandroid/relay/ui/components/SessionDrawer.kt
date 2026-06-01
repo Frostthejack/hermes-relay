@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Delete
@@ -53,6 +54,13 @@ fun SessionDrawerContent(
 ) {
     var renameDialogSession by remember { mutableStateOf<ChatSession?>(null) }
     var deleteDialogSession by remember { mutableStateOf<ChatSession?>(null) }
+
+    // FIX: Remember the LazyColumn scroll position across recompositions.
+    // Without this, any change to the sessions list (e.g., refreshSessions()
+    // from the server) causes the LazyColumn to reset scroll to 0 because
+    // the default list state is recreated on each recomposition when the
+    // drawer is closed and reopened.
+    val drawerListState = rememberLazyListState()
 
     ModalDrawerSheet(modifier = Modifier.width(300.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -108,7 +116,7 @@ fun SessionDrawerContent(
                 )
             }
         } else {
-            LazyColumn {
+            LazyColumn(state = drawerListState) {
                 items(sessions, key = { it.sessionId }) { session ->
                     SessionItem(
                         session = session,

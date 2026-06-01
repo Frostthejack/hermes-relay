@@ -933,17 +933,27 @@ class ChatHandler {
      * Update sessions list from API response.
      */
     fun updateSessions(items: List<SessionItem>) {
+        // FIX: Merge new sessions with existing ones instead of replacing wholesale.
+        // This preserves ChatSession object identity for unchanged sessions, which
+        // prevents the drawer's LazyColumn from re-rendering all items and losing
+        // its scroll position when refreshSessions() is called.
+        val existingById = _sessions.value.associateBy { it.sessionId }
         _sessions.value = items.map { item ->
-            // If > 1e12, already in milliseconds; otherwise convert from seconds
             val ts = item.startedAt ?: 0.0
             val timestampMs = if (ts > 1e12) ts.toLong() else (ts * 1000).toLong()
-            ChatSession(
-                sessionId = item.id,
-                title = item.title,
-                model = item.model,
-                messageCount = item.messageCount ?: 0,
-                updatedAt = timestampMs
-            )
+            val existing = existingById[item.id]
+            if (existing != null && existing.title == item.title && existing.model == item.model && existing.messageCount == item.messageCount) {
+                // Preserve existing object identity — only update timestamp
+                existing.copy(updatedAt = timestampMs)
+            } else {
+                ChatSession(
+                    sessionId = item.id,
+                    title = item.title,
+                    model = item.model,
+                    messageCount = item.messageCount ?: 0,
+                    updatedAt = timestampMs
+                )
+            }
         }
     }
 

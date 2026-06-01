@@ -531,14 +531,24 @@ fun ChatScreen(
     // Watch the user's scroll state. Any drag/fling that ends with the list
     // not at the bottom flips userScrolledAway = true. Returning to the
     // bottom (manually or via the FAB) resets it to false.
-    LaunchedEffect(listState) {
+    //
+    // FIX: During history loading (isLoadingHistory), the message list is in
+    // flux — items are being added/removed rapidly, which causes
+    // canScrollForward to oscillate. If we tracked this naively,
+    // userScrolledAway would flip to true mid-load even though the user
+    // never touched the scroll. We gate the "scrolled away" detection on
+    // !isLoadingHistory to prevent this.
+    LaunchedEffect(listState, isLoadingHistory) {
         snapshotFlow { listState.isScrollInProgress to isAtBottom }
             .distinctUntilChanged()
             .collectLatest { (scrolling, atBottom) ->
                 if (atBottom) {
                     userScrolledAway = false
-                } else if (!scrolling) {
+                } else if (!scrolling && !isLoadingHistory) {
                     // Scroll gesture ended above the bottom — user is reading.
+                    // Only set this when NOT loading history, to prevent the
+                    // transient list rebuild from falsely marking the user as
+                    // "scrolled away".
                     userScrolledAway = true
                 }
             }
@@ -658,6 +668,11 @@ fun ChatScreen(
     //      placement animations on every bubble fought with our concurrent
     //      animateScrollToItem — producing a flash where the viewport
     //      visibly settled twice.
+    //   6. During history loading (isLoadingHistory), the message list goes
+    //      from N → 0 → M items in rapid succession. The snapshotFlow
+    //      fires for each intermediate state, and collectLatest cancels
+    //      in-flight animations mid-way, causing the viewport to bounce
+    //      as competing scroll targets fight each other.
     //
     // The fix below uses snapshotFlow on a snapshot of every meaningful
     // streaming-state field. distinctUntilChanged debounces identical
@@ -669,8 +684,29 @@ fun ChatScreen(
     // The previous-snapshot var inside the LaunchedEffect coroutine lets us
     // distinguish "content arrived" from "state flipped" and "single
     // append" from "list rebuild", and pick the right scroll strategy.
-    LaunchedEffect(listState, smoothAutoScroll) {
+    //
+    // FIX for scroll bounce: the effect is also keyed on isLoadingHistory so
+    // it restarts cleanly when a history load begins/ends. While
+    // isLoadingHistory is true, auto-scroll is suppressed entirely — the
+    // list is in a transient state and any scroll targeting will fight with
+    // the incoming item animations. A small settling delay after history
+    // load completes ensures item animations finish before we start
+    // tracking scroll targets again.
+    LaunchedEffect(listState, smoothAutoScroll, isLoadingHistory) {
         if (!smoothAutoScroll) return@LaunchedEffect
+
+        // While history is loading, the message list is being rebuilt.
+        // Suppress auto-scroll entirely to prevent bounce from competing
+        // scroll targets during the N → 0 → M transition.
+        if (isLoadingHistory) return@LaunchedEffect
+
+        // After history load completes, wait for item animations to settle
+        // before resuming auto-scroll tracking. Without this, the
+        // snapshotFlow immediately fires with the new message list and
+        // animateScrollToItem races with the items' own animateItem()
+        // placement animations, producing a visible bounce.
+        delay(350)
+
         var previousSnapshot: ChatScrollSnapshot? = null
         snapshotFlow {
             val last = messages.lastOrNull()
