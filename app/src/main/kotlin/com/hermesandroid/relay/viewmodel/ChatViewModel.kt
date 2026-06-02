@@ -1397,6 +1397,17 @@ class ChatViewModel : ViewModel() {
             } else {
                 drainQueue()
             }
+
+            // FIX: Refresh the session list from the server after stream completes.
+            // The RelayApp LaunchedEffect that normally calls refreshSessions() is
+            // blocked by !isStreaming and does NOT re-trigger when isStreaming
+            // transitions to false (isStreaming is not a LaunchedEffect key).
+            // Without this, newly created sessions disappear from the sidebar.
+            if (sid != null) {
+                viewModelScope.launch {
+                    refreshSessions(justCreatedSessionId = sid)
+                }
+            }
         }
         val onUsageCb = { usage: UsageInfo? ->
             if (usage != null) {
