@@ -533,19 +533,19 @@ fun RelayApp() {
 
     LaunchedEffect(chatApiClient, activeConnectionId, selectedProfile?.name, lastSessionId) {
         if (chatApiClient == null) return@LaunchedEffect
-        chatViewModel.switchProfileContext(
-            contextKey = AgentDisplay.profileContextKey(
-                connectionId = activeConnectionId,
-                profileName = selectedProfile?.name,
-            ),
-            sessionId = lastSessionId,
-        )
-        // FIX: Skip refreshSessions if a stream is currently in flight.
-        // refreshSessions() replaces the session list wholesale, which races
-        // with the in-flight stream's onSessionId callback and can cause
-        // sessions to flash-disappear from the sidebar. The stream completion
-        // handler already triggers a sessions reload when needed.
+        // FIX: Skip switchProfileContext + refreshSessions entirely when a
+        // stream is in flight. switchProfileContext() cancels the active
+        // stream (line 470-473 in ChatViewModel) and clears messages,
+        // which causes sessions to disappear mid-stream. The stream
+        // completion handler already triggers a sessions reload when needed.
         if (!chatViewModel.isStreaming.value) {
+            chatViewModel.switchProfileContext(
+                contextKey = AgentDisplay.profileContextKey(
+                    connectionId = activeConnectionId,
+                    profileName = selectedProfile?.name,
+                ),
+                sessionId = lastSessionId,
+            )
             chatViewModel.refreshSessions()
         }
     }
