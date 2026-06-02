@@ -937,12 +937,16 @@ class ChatHandler {
      * Update sessions list from API response.
      */
     fun updateSessions(items: List<SessionItem>) {
-        // FIX: Merge new sessions with existing ones instead of replacing wholesale.
-        // This preserves ChatSession object identity for unchanged sessions, which
-        // prevents the drawer's LazyColumn from re-rendering all items and losing
-        // its scroll position when refreshSessions() is called.
+        Log.d("ChatHandler", "updateSessions: got ${items.size} sessions from server, existing=${_sessions.value.size}")
+        // FIX: True merge — preserves ChatSession object identity for unchanged
+        // sessions (prevents drawer LazyColumn from re-rendering/losing scroll
+        // on refreshSessions()) AND preserves locally-added sessions that the
+        // server hasn't indexed yet (e.g. just created via addSession() but
+        // refreshSessions() fires before the server returns it in list).
         val existingById = _sessions.value.associateBy { it.sessionId }
-        _sessions.value = items.map { item ->
+        val serverIds = items.map { it.id }.toSet()
+
+        val merged = items.map { item ->
             val ts = item.startedAt ?: 0.0
             val timestampMs = if (ts > 1e12) ts.toLong() else (ts * 1000).toLong()
             val existing = existingById[item.id]
@@ -959,6 +963,12 @@ class ChatHandler {
                 )
             }
         }
+
+        // Keep local sessions not yet returned by the server.
+        val localOnly = _sessions.value.filter { it.sessionId !in serverIds }
+
+        _sessions.value = merged + localOnly
+        Log.d("ChatHandler", "updateSessions: final session count=${_sessions.value.size} (server=${items.size} localOnly=${localOnly.size})")
     }
 
     fun clearSessions() {

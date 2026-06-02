@@ -82,6 +82,7 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.launch
 import com.hermesandroid.relay.util.HumanError
+import android.util.Log
 import kotlinx.coroutines.delay
 import com.hermesandroid.relay.ui.onboarding.OnboardingScreen
 import com.hermesandroid.relay.ui.screens.AboutScreen
@@ -533,12 +534,14 @@ fun RelayApp() {
 
     LaunchedEffect(chatApiClient, activeConnectionId, selectedProfile?.name, lastSessionId) {
         if (chatApiClient == null) return@LaunchedEffect
+        Log.d("RelayApp", "LaunchedEffect fired: lastSessionId=$lastSessionId isStreaming=${chatViewModel.isStreaming.value}")
         // FIX: Skip switchProfileContext + refreshSessions entirely when a
         // stream is in flight. switchProfileContext() cancels the active
         // stream (line 470-473 in ChatViewModel) and clears messages,
         // which causes sessions to disappear mid-stream. The stream
         // completion handler already triggers a sessions reload when needed.
         if (!chatViewModel.isStreaming.value) {
+            Log.d("RelayApp", "LaunchedEffect: calling switchProfileContext + refreshSessions")
             chatViewModel.switchProfileContext(
                 contextKey = AgentDisplay.profileContextKey(
                     connectionId = activeConnectionId,
@@ -546,7 +549,9 @@ fun RelayApp() {
                 ),
                 sessionId = lastSessionId,
             )
-            chatViewModel.refreshSessions()
+            chatViewModel.refreshSessions(justCreatedSessionId = lastSessionId)
+        } else {
+            Log.d("RelayApp", "LaunchedEffect: SKIPPED (streaming)")
         }
     }
 

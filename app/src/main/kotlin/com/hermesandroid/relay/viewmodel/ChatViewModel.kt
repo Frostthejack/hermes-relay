@@ -54,8 +54,23 @@ import kotlinx.serialization.json.contentOrNull
 import okhttp3.sse.EventSource
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
+import android.util.Log
 
 class ChatViewModel : ViewModel() {
+    companion object {
+        private const val TAG = "ChatViewModel"
+
+        // === PHASE3-status: APP_CONTEXT_PROMPT removed ===
+        // The old static one-liner used to live here. Replaced by the
+        // dynamic block built in PhoneStatusPromptBuilder.buildPromptBlock()
+        // from `appContextSettings` + a freshly-read PhoneSnapshot. See
+        // `send()` below for the construction site.
+        // === END PHASE3-status ===
+        const val MEDIA_TAP_TO_DOWNLOAD = "Tap to download"
+
+        /** Upper bound on the rolling tool-call history flow. */
+        const val TOOL_CALL_HISTORY_LIMIT = 10
+    }
 
     private var apiClient: HermesApiClient? = null
     private var chatHandler: ChatHandler? = null
@@ -92,19 +107,6 @@ class ChatViewModel : ViewModel() {
      * class surface small — the UI already switches on (state, errorMessage)
      * for the FAILED/LOADED cases.
      */
-    companion object {
-        // === PHASE3-status: APP_CONTEXT_PROMPT removed ===
-        // The old static one-liner used to live here. Replaced by the
-        // dynamic block built in PhoneStatusPromptBuilder.buildPromptBlock()
-        // from `appContextSettings` + a freshly-read PhoneSnapshot. See
-        // `send()` below for the construction site.
-        // === END PHASE3-status ===
-        const val MEDIA_TAP_TO_DOWNLOAD = "Tap to download"
-
-        /** Upper bound on the rolling tool-call history flow. */
-        const val TOOL_CALL_HISTORY_LIMIT = 10
-    }
-
     /** Callback to persist session ID — set by RelayApp */
     var onSessionChanged: ((String?) -> Unit)? = null
 
@@ -452,10 +454,12 @@ class ChatViewModel : ViewModel() {
         val client = apiClient
         val handler = chatHandler ?: return
         handler.activeAgentName = currentAgentDisplayName()
+        Log.d(TAG, "switchProfileContext: contextKey=$contextKey sessionId=$sessionId activeContextKey=$activeProfileContextKey currentSid=${handler.currentSessionId.value} isStreaming=${isStreaming.value}")
         if (
             activeProfileContextKey == contextKey &&
             handler.currentSessionId.value == sessionId
         ) {
+            Log.d(TAG, "switchProfileContext: no-op (same context + session)")
             return
         }
         if (
@@ -464,9 +468,11 @@ class ChatViewModel : ViewModel() {
             handler.currentSessionId.value == sessionId
         ) {
             activeProfileContextKey = contextKey
+            Log.d(TAG, "switchProfileContext: set context key only (first time, same session)")
             return
         }
 
+        Log.d(TAG, "switchProfileContext: CANCELING stream activeStream=$activeStream isStreaming=${isStreaming.value}")
         activeStream?.let { stream ->
             intentionallyCancelled = true
             stream.cancel()
@@ -519,12 +525,26 @@ class ChatViewModel : ViewModel() {
 
     // --- Session management ---
 
-    fun refreshSessions() {
+    fun refreshSessions(justCreatedSessionId: String? = null) {
         val client = apiClient ?: return
         val handler = chatHandler ?: return
+        Log.d(TAG, "refreshSessions: isStreaming=${isStreaming.value} sessionId=${handler.currentSessionId.value}")
         viewModelScope.launch {
+            // FIX: Debounce when a session was just created. The server may not
+            // have indexed the new session yet, so listSessions() returns stale
+            // data that causes updateSessions() to drop the locally-added session.
+            // A short delay gives the server time to catch up.
+            if (justCreatedSessionId != null) {
+                Log.d(TAG, "refreshSessions: delaying 600ms for session $justCreatedSessionId to be indexed")
+                kotlinx.coroutines.delay(600)
+                // If the session was added locally during the delay, it will be
+                // preserved by updateSessions()'s merge logic.
+            }
             client.listSessionsResult().fold(
-                onSuccess = { sessions -> handler.updateSessions(sessions) },
+                onSuccess = { sessions ->
+                    Log.d(TAG, "refreshSessions: got ${sessions.size} sessions from server")
+                    handler.updateSessions(sessions)
+                },
                 onFailure = { error -> emitError(error, context = "load_sessions") }
             )
         }
