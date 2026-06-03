@@ -384,7 +384,7 @@ class ConnectionStore private constructor(
         // Match the defaults used by ConnectionViewModel so a seeded connection
         // from migrateLegacyConnectionIfNeeded() resolves to the same endpoints
         // a fresh install would.
-        private const val DEFAULT_API_URL = "http://localhost:8642"
-        private const val DEFAULT_RELAY_URL = "ws://localhost:8767"
+        private const val DEFAULT_API_URL = ""
+        private const val DEFAULT_RELAY_URL = ""
     }
 }

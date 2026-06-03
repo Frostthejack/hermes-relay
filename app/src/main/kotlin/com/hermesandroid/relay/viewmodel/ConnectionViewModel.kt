@@ -81,12 +81,12 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     companion object {
         // API Server (direct chat)
         private val KEY_API_SERVER_URL = stringPreferencesKey("api_server_url")
-        private const val DEFAULT_API_URL = "http://localhost:8642"
+        private const val DEFAULT_API_URL = ""
 
         // Relay Server (bridge/terminal)
         private val KEY_RELAY_URL = stringPreferencesKey("relay_url")
         private val KEY_SERVER_URL = stringPreferencesKey("server_url") // legacy migration
-        private const val DEFAULT_RELAY_URL = "ws://localhost:8767"
+        private const val DEFAULT_RELAY_URL = ""
 
         // How long the derived [relayUiState] shows `Connecting` before
         // promoting a Paired-but-Disconnected pose to `Stale`. Tuned to
