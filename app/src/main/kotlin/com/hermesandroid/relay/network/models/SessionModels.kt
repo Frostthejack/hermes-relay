@@ -81,6 +81,7 @@ object FlexibleIdNonNullSerializer : KSerializer<String> {
 data class SessionListResponse(
     val items: List<SessionItem>? = null,
     val sessions: List<SessionItem>? = null, // alternate key
+    val data: List<SessionItem>? = null, // matches gateway's "data" key
     val total: Int? = null
 )
 
