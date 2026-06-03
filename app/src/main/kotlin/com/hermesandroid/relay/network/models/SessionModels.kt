@@ -128,6 +128,7 @@ data class RenameSessionRequest(
 data class MessageListResponse(
     val items: List<MessageItem>? = null,
     val messages: List<MessageItem>? = null, // alternate key
+    val data: List<MessageItem>? = null, // matches gateway's "data" key
     val total: Int? = null
 )
 

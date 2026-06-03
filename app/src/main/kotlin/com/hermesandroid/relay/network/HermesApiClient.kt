@@ -233,7 +233,6 @@ class HermesApiClient(
     suspend fun listSessionsResult(limit: Int = 50): Result<List<SessionItem>> = withContext(Dispatchers.IO) {
         try {
             val url = "$baseUrl/api/sessions?limit=$limit"
-            Log.d(TAG, "listSessionsResult: baseUrl=$baseUrl url=$url")
             val request = authRequest(url).get().build()
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
@@ -333,7 +332,7 @@ class HermesApiClient(
                 if (!response.isSuccessful) return@withContext emptyList()
                 val body = response.body?.string() ?: return@withContext emptyList()
                 val parsed = json.decodeFromString<MessageListResponse>(body)
-                parsed.items ?: parsed.messages ?: emptyList()
+                parsed.data ?: parsed.items ?: parsed.messages ?: emptyList()
             }
         } catch (e: Exception) {
             Log.w(TAG, "Failed to get messages: ${e.message}")
